@@ -1,0 +1,1967 @@
+"""HypeClipper - find and cut the hypest moments from a video.
+
+Dependencies: Python standard library + customtkinter.
+External tools (must be on PATH): ffmpeg, ffprobe, yt-dlp.
+
+API notes (FreeLLMAPI):
+  - Whisper endpoint only supports response_format="verbose_json" (not srt/vtt).
+    We request JSON then convert locally to SRT before burning with ffmpeg.
+  - TTS endpoint only supports model="auto" (not "tts-1").
+"""
+import glob
+import json
+import math
+import os
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+import zipfile
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+
+# --windowed PyInstaller builds have no stdin; without this every child process
+# (ffmpeg / yt-dlp) can fail with "[WinError 6] The handle is invalid".
+_RealPopen = subprocess.Popen
+
+
+class _SafePopen(_RealPopen):
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("stdin", subprocess.DEVNULL)
+        if os.name == "nt":
+            kwargs.setdefault("creationflags", 0x08000000)
+        super().__init__(*args, **kwargs)
+
+
+subprocess.Popen = _SafePopen
+
+APP_NAME = "HypeClipper"
+DEFAULT_API = "http://127.0.0.1:31415/v1"
+WHISPER_MODEL = "whisper-large-v3-turbo"
+# caption language menu -> (whisper language code, optional style prompt)
+CAPTION_LANGS = {
+    "Auto-detect": (None, None),
+    "English": ("en", None),
+    "Hindi": ("hi", None),
+    "Punjabi": ("pa", None),
+    "Hinglish (Hindi in English letters)": (
+        "hi", "Yeh video Hinglish mein hai. Hindi words ko Roman letters mein likho, "
+              "jaise: kya haal hai bhai."),
+}
+CAPTION_STYLES = {
+    "Viral Yellow (MrBeast)": {
+        "primary": "&H0000FFFF",  # Bright Yellow (BGR)
+        "outline": "&H00000000",
+        "back": "&H80000000",
+        "border_style": 1,
+        "outline_w": 4,
+        "shadow": 2,
+        "font": "Impact",
+    },
+    "Hormozi Lime": {
+        "primary": "&H0032FF32",  # Neon Lime Green
+        "outline": "&H00000000",
+        "back": "&H80000000",
+        "border_style": 1,
+        "outline_w": 4,
+        "shadow": 2,
+        "font": "Impact",
+    },
+    "TikTok White": {
+        "primary": "&H00FFFFFF",  # Pure White
+        "outline": "&H00000000",
+        "back": "&H80000000",
+        "border_style": 1,
+        "outline_w": 4,
+        "shadow": 2,
+        "font": "Arial Black",
+    },
+    "Cyber Cyan": {
+        "primary": "&H00FFFF00",  # Electric Cyan
+        "outline": "&H00000000",
+        "back": "&H80000000",
+        "border_style": 1,
+        "outline_w": 4,
+        "shadow": 2,
+        "font": "Impact",
+    },
+    "Fire Orange": {
+        "primary": "&H000088FF",  # Punchy Orange
+        "outline": "&H00000000",
+        "back": "&H80000000",
+        "border_style": 1,
+        "outline_w": 4,
+        "shadow": 2,
+        "font": "Impact",
+    },
+    "Black Box Pill": {
+        "primary": "&H00FFFFFF",
+        "outline": "&H00000000",
+        "back": "&HA0000000",  # Translucent black box
+        "border_style": 3,     # Opaque bounding box
+        "outline_w": 0,
+        "shadow": 0,
+        "font": "Arial Black",
+    },
+    "Minimal Clean": {
+        "primary": "&H00F0F0F0",
+        "outline": "&H00111111",
+        "back": "&H00000000",
+        "border_style": 1,
+        "outline_w": 2,
+        "shadow": 1,
+        "font": "Arial",
+    },
+}
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+BASE = base_dir()
+# tools may sit next to HypeClipper.exe or in the auto-install folder
+TOOLS_DIRS = [os.path.join(BASE, "tools"),
+              os.path.join(os.environ.get("LOCALAPPDATA") or BASE, "HypeClipper", "tools")]
+os.environ["PATH"] = os.pathsep.join([BASE] + TOOLS_DIRS) + os.pathsep + os.environ.get("PATH", "")
+TEMP_DIR = os.path.join(BASE, "temp")
+OUT_DIR = os.path.join(BASE, "output_clips")
+VIDEOS_DIR = os.path.join(BASE, "videos")
+LOG_FILE = os.path.join(BASE, "hypeclipper.log")
+SETTINGS_FILE = os.path.join(BASE, "hypeclipper_settings.json")
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_settings(**kw):
+    data = load_settings()
+    data.update(kw)
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except OSError:
+        pass
+
+
+# API key: environment variable first, then the settings file next to the .exe
+API_KEY = (os.environ.get("FREELLMAPI_KEY") or load_settings().get("api_key") or "").strip()
+
+
+def set_api_key(key):
+    global API_KEY
+    API_KEY = (key or "").strip()
+
+
+def auth_headers(extra=None):
+    h = dict(extra or {})
+    if API_KEY:
+        h["Authorization"] = "Bearer " + API_KEY
+    return h
+
+
+# --------------------------------------------------------------------------
+# Helpers
+# --------------------------------------------------------------------------
+def sanitize(title, maxlen=60):
+    s = re.sub(r"[^\w\- ]+", "", str(title), flags=re.UNICODE).strip()
+    s = re.sub(r"\s+", "_", s)
+    return (s[:maxlen] or "clip")
+
+
+def fmt_time(t):
+    t = int(max(0, t))
+    return "%d:%02d" % (t // 60, t % 60)
+
+
+def format_srt_time(seconds):
+    """Convert float seconds to SRT timestamp HH:MM:SS,mmm."""
+    s = max(0.0, float(seconds))
+    h = int(s // 3600)
+    m = int((s % 3600) // 60)
+    sec = int(s % 60)
+    ms = int(round((s - int(s)) * 1000))
+    if ms >= 1000:
+        ms = 999
+    return "%02d:%02d:%02d,%03d" % (h, m, sec, ms)
+
+
+def json_to_srt(data, words_per_chunk=3, uppercase=True, min_duration=0.35, max_duration=2.5):
+    """Convert Whisper verbose_json response to SRT text.
+
+    Groups words into chunks of `words_per_chunk` for readable subtitle lines.
+    Handles both word-level timestamps and segment-level timestamps.
+    """
+    srt_blocks = []
+    idx = 1
+
+    def clean_text(t):
+        t = (t or "").strip()
+        if uppercase:
+            t = t.upper()
+        # Clean trailing periods from punchy shorts lines so it reads crisper
+        if words_per_chunk <= 4 and t.endswith(".") and not t.endswith("..."):
+            t = t[:-1].strip()
+        return t
+
+    # Try word-level timestamps first (more precise)
+    words = data.get("words") or []
+    if not words:
+        # Some models put words inside segments
+        for seg in data.get("segments", []):
+            words.extend(seg.get("words", []))
+
+    if words:
+        # Group words into chunks
+        for i in range(0, len(words), words_per_chunk):
+            chunk = words[i:i + words_per_chunk]
+            if not chunk:
+                continue
+            start = chunk[0].get("start", 0)
+            end = chunk[-1].get("end", start + min_duration)
+            # Enforce minimum / maximum duration
+            if end - start < min_duration:
+                end = start + min_duration
+            if end - start > max_duration:
+                end = start + max_duration
+            raw = " ".join(w.get("word", "").strip() for w in chunk).strip()
+            text = clean_text(raw)
+            if not text:
+                continue
+            srt_blocks.append(
+                "%d\n%s --> %s\n%s\n"
+                % (idx, format_srt_time(start), format_srt_time(end), text))
+            idx += 1
+    else:
+        # Fall back to segment-level timestamps
+        for seg in data.get("segments", []):
+            start = seg.get("start", 0)
+            end = seg.get("end", start + 2)
+            raw = seg.get("text", "").strip()
+            if not raw:
+                continue
+            # Split long segments into smaller subtitle blocks
+            seg_words = raw.split()
+            if len(seg_words) <= words_per_chunk:
+                text = clean_text(raw)
+                srt_blocks.append(
+                    "%d\n%s --> %s\n%s\n"
+                    % (idx, format_srt_time(start), format_srt_time(end), text))
+                idx += 1
+            else:
+                seg_dur = end - start
+                total_words = len(seg_words)
+                for j in range(0, total_words, words_per_chunk):
+                    sub_words = seg_words[j:j + words_per_chunk]
+                    frac_start = start + seg_dur * (j / total_words)
+                    frac_end = start + seg_dur * (min(j + words_per_chunk, total_words)
+                                                   / total_words)
+                    text = clean_text(" ".join(sub_words))
+                    srt_blocks.append(
+                        "%d\n%s --> %s\n%s\n"
+                        % (idx, format_srt_time(frac_start),
+                           format_srt_time(frac_end),
+                           text))
+                    idx += 1
+
+    if not srt_blocks:
+        # Last resort: just use the top-level text
+        text = clean_text(data.get("text", ""))
+        if text:
+            srt_blocks.append("1\n00:00:00,000 --> 00:00:05,000\n%s\n" % text)
+
+    return "\n".join(srt_blocks)
+
+
+def run_stream(cmd, log, cwd=None, collect=None):
+    """Run a command, streaming merged stdout/stderr lines to log. Returns exit code."""
+    log("$ " + " ".join(cmd))
+    try:
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, encoding="utf-8", errors="replace",
+            creationflags=CREATE_NO_WINDOW,
+        )
+    except FileNotFoundError:
+        log("ERROR: '%s' not found. Install it and make sure it is on PATH." % cmd[0])
+        return -1
+    for line in proc.stdout:
+        line = line.rstrip()
+        if line:
+            log(line)
+            if collect is not None:
+                collect.append(line)
+    proc.wait()
+    return proc.returncode
+
+
+def run_capture(cmd):
+    try:
+        return subprocess.run(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace", creationflags=CREATE_NO_WINDOW,
+        )
+    except (FileNotFoundError, OSError) as e:
+        return subprocess.CompletedProcess(cmd, 127, "", "could not run %s: %s" % (cmd[0], e))
+
+
+# --------------------------------------------------------------------------
+# Input: download or local file
+# --------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# Auto-install of ffmpeg / ffprobe / yt-dlp / deno (Windows)
+# --------------------------------------------------------------------------
+YTDLP_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+FFMPEG_URLS = [
+    "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip",
+    "https://github.com/BtbN/FFmpeg-Builds/releases/latest/download/"
+    "ffmpeg-master-latest-win64-gpl.zip",
+]
+DENO_URL = ("https://github.com/denoland/deno/releases/latest/download/"
+            "deno-x86_64-pc-windows-msvc.zip")
+CORE_TOOLS = ("ffmpeg", "ffprobe", "yt-dlp")
+
+
+def missing_tools():
+    return [t for t in CORE_TOOLS if not shutil.which(t)]
+
+
+def writable_tools_dir():
+    for d in TOOLS_DIRS:
+        try:
+            os.makedirs(d, exist_ok=True)
+            probe = os.path.join(d, ".write_test")
+            with open(probe, "w") as f:
+                f.write("x")
+            os.remove(probe)
+            return d
+        except OSError:
+            continue
+    raise OSError("no writable folder for tools")
+
+
+def download_file(url, dest, log, status=None, label="file"):
+    req = urllib.request.Request(url, headers={"User-Agent": "HypeClipper/1.0"})
+    part = dest + ".part"
+    with urllib.request.urlopen(req, timeout=60) as r, open(part, "wb") as f:
+        total = int(r.headers.get("Content-Length") or 0)
+        done, last_pct = 0, -10
+        while True:
+            chunk = r.read(256 * 1024)
+            if not chunk:
+                break
+            f.write(chunk)
+            done += len(chunk)
+            if total:
+                pct = int(done * 100 / total)
+                if status:
+                    status("Downloading %s... %d%%" % (label, pct), "#4da3ff")
+                if pct >= last_pct + 10:
+                    last_pct = pct
+                    log("  %s: %d%% (%.1f / %.1f MB)" % (label, pct, done / 1e6, total / 1e6))
+    os.replace(part, dest)
+
+
+def extract_from_zip(zip_path, wanted, dest_dir):
+    """Extract files whose base name is in `wanted`, flattening folders."""
+    got = []
+    wanted = set(w.lower() for w in wanted)
+    with zipfile.ZipFile(zip_path) as z:
+        for name in z.namelist():
+            base = os.path.basename(name)
+            if base.lower() in wanted:
+                with z.open(name) as src, open(os.path.join(dest_dir, base), "wb") as dst:
+                    shutil.copyfileobj(src, dst)
+                got.append(base)
+    return got
+
+
+def _install_zip(urls, wanted, dest_dir, log, status, label):
+    last_err = None
+    for url in urls:
+        zpath = os.path.join(dest_dir, label + ".zip")
+        try:
+            log("Downloading %s from %s" % (label, url))
+            download_file(url, zpath, log, status, label)
+            got = extract_from_zip(zpath, wanted, dest_dir)
+            if len(got) >= len(wanted):
+                return True
+            last_err = "archive did not contain %s" % ", ".join(wanted)
+        except Exception as e:
+            last_err = e
+            log("  failed: %s" % e)
+        finally:
+            for junk in (zpath, zpath + ".part"):
+                try:
+                    if os.path.isfile(junk):
+                        os.remove(junk)
+                except OSError:
+                    pass
+    log("ERROR: could not install %s (%s)" % (label, last_err))
+    return False
+
+
+def install_tools(log, status=None):
+    """Download whatever is missing. Returns True if all core tools are present afterwards."""
+    if os.name != "nt":
+        log("Auto-install is for Windows. Install ffmpeg and yt-dlp with your package "
+            "manager (e.g. brew install ffmpeg yt-dlp / apt install ffmpeg yt-dlp).")
+        return not missing_tools()
+    try:
+        dest = writable_tools_dir()
+    except OSError as e:
+        log("ERROR: %s" % e)
+        return False
+    log("Installing tools into: " + dest)
+    need = missing_tools()
+    if "yt-dlp" in need:
+        try:
+            log("Downloading yt-dlp...")
+            download_file(YTDLP_URL, os.path.join(dest, "yt-dlp.exe"), log, status, "yt-dlp")
+        except Exception as e:
+            log("ERROR: could not download yt-dlp (%s)" % e)
+    if "ffmpeg" in need or "ffprobe" in need:
+        _install_zip(FFMPEG_URLS, ("ffmpeg.exe", "ffprobe.exe"), dest, log, status, "ffmpeg")
+    if not shutil.which("deno"):
+        # yt-dlp needs a JavaScript runtime for current YouTube; failure here is non-fatal
+        _install_zip([DENO_URL], ("deno.exe",), dest, log, status, "deno")
+    left = missing_tools()
+    if left:
+        log("Still missing: %s. Download them manually and put the .exe files next to "
+            "HypeClipper.exe." % ", ".join(left))
+    else:
+        log("All tools installed.")
+    return not left
+
+
+def is_url(s):
+    return bool(re.match(r"^https?://", s, re.I))
+
+
+YTDLP_HINTS = [
+    (("sign in to confirm", "not a bot", "cookies"),
+     "YouTube wants you signed in. On the Source tab choose your browser under "
+     "'Cookies from browser' (be logged into YouTube there), then try again."),
+    (("429", "too many requests"),
+     "YouTube is rate-limiting you. Wait a few minutes, or use 'Cookies from browser'."),
+    (("javascript runtime", "js runtime", "deno", "nsig", "signature"),
+     "yt-dlp needs a JavaScript runtime and an up-to-date version. Click 'Update yt-dlp' "
+     "and install Deno (winget install DenoLand.Deno), then restart HypeClipper."),
+    (("requested format is not available", "unable to extract", "http error 403"),
+     "YouTube changed something. Click 'Update yt-dlp' and try again."),
+    (("ffmpeg is not installed", "ffmpeg not found", "ffprobe and ffmpeg"),
+     "ffmpeg was not found. Install it, or put ffmpeg.exe next to HypeClipper.exe."),
+    (("private video", "video unavailable", "members-only", "age"),
+     "The video is private, removed, members-only or age-restricted "
+     "(age-restricted ones need 'Cookies from browser')."),
+]
+
+
+def explain_ytdlp_failure(lines, log):
+    blob = "\n".join(lines).lower()
+    shown = False
+    for keys, msg in YTDLP_HINTS:
+        if any(k in blob for k in keys):
+            log("HINT: " + msg)
+            shown = True
+    if not shown:
+        log("HINT: Try 'Update yt-dlp' on the Source tab, or download the video yourself "
+            "and use 'Select Local Video'.")
+
+
+def _find_downloaded(lines, folder=None):
+    found = None
+    for ln in lines:
+        for pat in (r'Merging formats into "(.+?)"',
+                    r"\[download\] Destination: (.+\.mp4)\s*$",
+                    r"\[download\] (.+\.mp4) has already been downloaded"):
+            m = re.search(pat, ln)
+            if m and os.path.isfile(m.group(1)):
+                found = m.group(1)
+    if found:
+        return found
+    mp4s = glob.glob(os.path.join(folder or TEMP_DIR, "*.mp4"))
+    return max(mp4s, key=os.path.getmtime) if mp4s else None
+
+
+def download_video(url, log, cookies_browser=None, dl_dir=None, quality=None):
+    dl_dir = dl_dir or VIDEOS_DIR
+    os.makedirs(dl_dir, exist_ok=True)
+    log("Saving download to: " + dl_dir)
+    if not shutil.which("yt-dlp"):
+        log("ERROR: yt-dlp not found. Install it (pip install yt-dlp or the .exe) and make "
+            "sure it is on PATH, or put yt-dlp.exe next to HypeClipper.exe.")
+        return None
+
+    quality_map = {
+        "Maximum (4K/1440p/Best)": "bestvideo+bestaudio/best",
+        "1080p Full HD (Crisp)": "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "720p HD": "bestvideo[height<=720]+bestaudio/best[height<=720]/best",
+        "Auto / Fast": "bv*+ba/b",
+    }
+    chosen_fmt = quality_map.get(quality, "bestvideo[height<=1080]+bestaudio/best[height<=1080]/best")
+    log("Download quality target: %s (%s)" % (quality or "1080p Full HD (Crisp)", chosen_fmt))
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    ffmpeg_dir = os.path.dirname(os.path.abspath(ffmpeg_bin)) if ffmpeg_bin else None
+
+    def build(with_subs, fmt):
+        cmd = ["yt-dlp", "--no-playlist", "--newline", "-f", fmt,
+               "--format-sort", "res,fps",
+               "--merge-output-format", "mp4", "--write-info-json",
+               "-o", os.path.join(dl_dir, "%(title).80B [%(id)s].%(ext)s")]
+        if ffmpeg_dir:
+            cmd += ["--ffmpeg-location", ffmpeg_dir]
+        if with_subs:
+            cmd += ["--write-auto-subs", "--sub-langs", "en,hi,pa"]
+        if cookies_browser and cookies_browser.lower() != "none":
+            cmd += ["--cookies-from-browser", cookies_browser.lower()]
+        return cmd + [url]
+
+    attempts = [(True, chosen_fmt), (False, chosen_fmt), (False, "bv*+ba/b")]
+    all_lines = []
+    for n, (subs, fmt) in enumerate(attempts, 1):
+        lines = []
+        code = run_stream(build(subs, fmt), log, collect=lines)
+        all_lines += lines
+        video = _find_downloaded(lines, dl_dir)
+        if video and os.path.isfile(video):
+            if code != 0:
+                log("Note: yt-dlp reported a problem (often subtitles being rate-limited) "
+                    "but the video downloaded fine - continuing.")
+            return video
+        if n < len(attempts):
+            log("Download failed (code %s). Retrying with simpler settings..." % code)
+    log("ERROR: could not download the video.")
+    explain_ytdlp_failure(all_lines, log)
+    return None
+
+
+def get_duration(path, info):
+    if shutil.which("ffprobe"):
+        r = run_capture(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                         "-of", "csv=p=0", path])
+        try:
+            return float(r.stdout.strip().splitlines()[0])
+        except (ValueError, IndexError):
+            pass
+    if info and info.get("duration"):
+        return float(info["duration"])
+    return 0.0
+
+
+# --------------------------------------------------------------------------
+# Hype detection
+# --------------------------------------------------------------------------
+def audio_peaks(path, duration, log, top_n=15, min_gap=10.0):
+    """Loudest moments via ffmpeg astats RMS (1.5 s windows)."""
+    log("Scanning audio loudness with ffmpeg (this can take a while)...")
+    af = ("aresample=16000,asetnsamples=n=8000:p=0,"
+          "astats=metadata=1:reset=3,"
+          "ametadata=print:key=lavfi.astats.Overall.RMS_level:file=-")
+    cmd = ["ffmpeg", "-hide_banner", "-nostats", "-v", "error", "-i", path,
+           "-vn", "-af", af, "-f", "null", "-"]
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, encoding="utf-8", errors="replace",
+                                creationflags=CREATE_NO_WINDOW)
+    except FileNotFoundError:
+        log("ERROR: ffmpeg not found on PATH.")
+        return []
+    samples = []
+    cur_t = None
+    for line in proc.stdout:
+        m = re.search(r"pts_time:([\d.]+)", line)
+        if m:
+            cur_t = float(m.group(1))
+            continue
+        m = re.search(r"RMS_level=(-?[\d.]+|-inf|inf)", line)
+        if m and cur_t is not None:
+            v = m.group(1)
+            if "inf" not in v:
+                samples.append((cur_t, float(v)))
+    proc.wait()
+    if not samples:
+        log("No audio samples parsed (video may have no audio).")
+        return []
+    samples.sort(key=lambda x: x[1], reverse=True)
+    peaks = []
+    for t, v in samples:
+        if all(abs(t - pt) >= min_gap for pt, _ in peaks):
+            peaks.append((t, v))
+        if len(peaks) >= top_n:
+            break
+    peaks.sort()
+    log("Found %d audio peaks." % len(peaks))
+    return [{"time": round(t, 1), "rms_db": round(v, 1)} for t, v in peaks]
+
+
+def heatmap_peaks(info, top_n=10):
+    hm = (info or {}).get("heatmap")
+    if not hm:
+        return []
+    best = sorted(hm, key=lambda h: h.get("value", 0), reverse=True)[:top_n]
+    best.sort(key=lambda h: h.get("start_time", 0))
+    return [{"start": round(h["start_time"], 1), "end": round(h["end_time"], 1),
+             "intensity": round(h.get("value", 0), 3)} for h in best]
+
+
+def replayed_clips(info, duration, clip_len, max_clips):
+    """Pick the windows with the highest total replay/watch-time from YouTube's heatmap."""
+    hm = (info or {}).get("heatmap")
+    if not hm:
+        return []
+    segs = [(float(h["start_time"]), float(h["end_time"]), float(h.get("value", 0)))
+            for h in hm if "start_time" in h and "end_time" in h]
+    if not segs:
+        return []
+    if not duration:
+        duration = segs[-1][1]
+    clip_len = min(clip_len, duration)
+
+    def score(start):
+        end = start + clip_len
+        total = 0.0
+        for a, b, v in segs:
+            ov = min(b, end) - max(a, start)
+            if ov > 0:
+                total += v * ov
+        return total / clip_len
+
+    cands = []
+    for a, b, v in segs:
+        centre = (a + b) / 2.0
+        start = min(max(0.0, centre - clip_len / 2.0), max(0.0, duration - clip_len))
+        cands.append((score(start), start))
+    cands.sort(reverse=True)
+    chosen = []
+    for sc, st in cands:
+        if all(st + clip_len <= c["start_time"] or st >= c["end_time"] for c in chosen):
+            chosen.append({"start_time": st, "end_time": st + clip_len,
+                           "title": "Top_Replay_%d" % (len(chosen) + 1),
+                           "score": round(sc, 3)})
+        if len(chosen) >= max_clips:
+            break
+    chosen.sort(key=lambda c: c["start_time"])
+    return chosen
+
+
+def load_transcript(video_path, limit=6000):
+    stem = os.path.splitext(video_path)[0]
+    subs = []
+    for lang in ("en", "hi", "pa"):
+        subs += glob.glob(glob.escape(stem) + "." + lang + "*.vtt")
+    if not subs:
+        return ""
+    lines, last = [], ""
+    ts = 0.0
+    for raw in open(subs[0], encoding="utf-8", errors="replace"):
+        raw = raw.strip()
+        m = re.match(r"(\d+):(\d+):([\d.]+)\s+-->", raw)
+        if m:
+            ts = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            continue
+        if not raw or raw.startswith(("WEBVTT", "Kind:", "Language:", "NOTE")) or "-->" in raw:
+            continue
+        text = re.sub(r"<[^>]+>", "", raw).strip()
+        if text and text != last:
+            lines.append("[%s] %s" % (fmt_time(ts), text))
+            last = text
+    out = "\n".join(lines)
+    if len(out) > limit:
+        step = len(out) / float(limit)
+        out = "\n".join(lines[:: max(1, int(step) + 1)])[:limit]
+    return out
+
+
+# --------------------------------------------------------------------------
+# Local LLM
+# --------------------------------------------------------------------------
+def api_base(url):
+    url = url.strip().rstrip("/")
+    if url.endswith("/v1"):
+        url = url[:-3]
+    return url
+
+
+def pick_model(base, log):
+    req = urllib.request.Request(base + "/v1/models", headers=auth_headers())
+    with urllib.request.urlopen(req, timeout=15) as r:
+        data = json.loads(r.read().decode("utf-8"))
+    ids = [m.get("id") for m in data.get("data", []) if m.get("id")]
+    ids = [i for i in ids if "embed" not in i.lower()] or ids
+    if not ids:
+        raise RuntimeError("No models available at " + base)
+    log("Using model: " + ids[0])
+    return ids[0]
+
+
+def parse_clip_json(text):
+    """Parse the model's clip list; salvage complete objects if the reply was cut off."""
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
+    text = re.sub(r"<think>.*", "", text, flags=re.S) if "</think>" not in text else text
+    text = text.replace("```json", "").replace("```", "")
+    m = re.search(r"\[.*\]", text, re.S)
+    if m:
+        try:
+            data = json.loads(m.group(0))
+            if isinstance(data, list):
+                return data
+        except ValueError:
+            pass
+    items = []
+    for obj in re.findall(r"\{[^{}]*\}", text):
+        try:
+            d = json.loads(obj)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and "start_time" in d and "end_time" in d:
+            items.append(d)
+    if not items:
+        raise ValueError("Model did not return usable clips: " + text[:200])
+    return items
+
+
+def ask_llm(base, model, duration, clip_len, max_clips, a_peaks, h_peaks, transcript, log):
+    system = ("You are a viral video editor. Reply with ONLY a JSON array, no prose, "
+              "no markdown. Each item: {\"start_time\": number, \"end_time\": number, "
+              "\"title\": string}. Times are seconds.")
+    user = (
+        "Video duration: %.0f seconds.\n"
+        "Pick up to %d of the best NON-OVERLAPPING clips, each about %d seconds long "
+        "(never longer than %d), starting slightly before a peak so the build-up is included.\n"
+        "Loudest audio moments (crowd cheers/laughter/drops): %s\n"
+        "YouTube replay heatmap peaks: %s\n"
+        "Transcript:\n%s\n\n"
+        "Return the JSON array now. Titles must be short and catchy using underscores, "
+        "e.g. \"Crowd_Goes_Wild\"."
+        % (duration, max_clips, clip_len, clip_len + 10,
+           json.dumps(a_peaks), json.dumps(h_peaks), transcript or "(none)")
+    )
+    body = json.dumps({
+        "model": model, "temperature": 0.3, "max_tokens": 4096,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+    }).encode("utf-8")
+    req = urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                 headers=auth_headers({"Content-Type": "application/json"}))
+    log("Asking the model for the best clips...")
+    with urllib.request.urlopen(req, timeout=300) as r:
+        resp = json.loads(r.read().decode("utf-8"))
+    choice = resp["choices"][0]
+    text = choice["message"].get("content") or ""
+    if choice.get("finish_reason") == "length":
+        log("Note: the model's reply was cut off (token limit); using the clips it finished.")
+    return parse_clip_json(text)
+
+
+def clean_clips(raw, duration, clip_len, max_clips):
+    clips = []
+    for c in raw:
+        try:
+            s = float(c["start_time"])
+            e = float(c["end_time"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        s = max(0.0, s)
+        if duration:
+            e = min(e, duration)
+        if e - s > clip_len + 10:
+            e = s + clip_len
+        if e - s < 3:
+            continue
+        clips.append({"start_time": s, "end_time": e,
+                      "title": sanitize(c.get("title", "clip"))})
+    clips.sort(key=lambda c: c["start_time"])
+    final = []
+    for c in clips:
+        if not final or c["start_time"] >= final[-1]["end_time"]:
+            final.append(c)
+    return final[:max_clips]
+
+
+def fallback_clips(a_peaks, h_peaks, duration, clip_len, max_clips):
+    """Rank moments by loudness AND YouTube replay intensity together."""
+    cands = []
+    if a_peaks:
+        lo = min(p["rms_db"] for p in a_peaks)
+        hi = max(p["rms_db"] for p in a_peaks)
+        span = (hi - lo) or 1.0
+        for p in a_peaks:
+            sc = (p["rms_db"] - lo) / span
+            boost = max([h["intensity"] for h in h_peaks
+                         if h["start"] <= p["time"] <= h["end"]] or [0.0])
+            cands.append((sc + boost, p["time"]))
+    for h in h_peaks:
+        has_audio = any(h["start"] <= p["time"] <= h["end"] for p in a_peaks)
+        cands.append((h["intensity"] + (0.5 if has_audio else 0.0),
+                      (h["start"] + h["end"]) / 2))
+    cands.sort(reverse=True)
+    raw = []
+    for n, (_, t) in enumerate(cands, 1):
+        st = max(0.0, t - clip_len * 0.6)
+        raw.append({"start_time": st, "end_time": st + clip_len,
+                    "title": "Hype_Moment_%d" % n})
+    chosen = []
+    for c in raw:
+        if all(c["end_time"] <= x["start_time"] or c["start_time"] >= x["end_time"]
+               for x in chosen):
+            chosen.append(c)
+        if len(chosen) >= max_clips:
+            break
+    return clean_clips(chosen, duration, clip_len, max_clips)
+
+
+def detect_silences(video, log):
+    """Midpoints of natural pauses, used as clean cut points."""
+    log("Finding natural pauses so clips don't cut mid-word...")
+    r = run_capture(["ffmpeg", "-hide_banner", "-nostats", "-i", video, "-vn",
+                     "-af", "silencedetect=noise=-32dB:d=0.3", "-f", "null", "-"])
+    starts = re.findall(r"silence_start: (-?[\d.]+)", r.stderr)
+    ends = re.findall(r"silence_end: ([\d.]+)", r.stderr)
+    mids = [(max(0.0, float(a)) + float(b)) / 2 for a, b in zip(starts, ends)]
+    log("Found %d pauses." % len(mids))
+    return mids
+
+
+def snap_clips(clips, mids, duration, clip_len):
+    """Nudge each clip's start/end onto the nearest natural pause."""
+    if not mids:
+        return clips
+    out, prev_end = [], 0.0
+    for c in sorted(clips, key=lambda c: c["start_time"]):
+        s0, e0 = c["start_time"], c["end_time"]
+        ns = min((m for m in mids if s0 - 3 <= m <= s0 + 2),
+                 key=lambda m: abs(m - s0), default=s0)
+        ne = min((m for m in mids if e0 - 2 <= m <= e0 + 4),
+                 key=lambda m: abs(m - e0), default=e0)
+        if ne - ns < 5 or ne - ns > clip_len + 12:
+            ns, ne = s0, e0
+        ns = max(ns - 0.1, prev_end, 0.0)
+        ne = ne + 0.1
+        if duration:
+            ne = min(ne, duration)
+        if ne - ns < 3:
+            continue
+        d = dict(c)
+        d["start_time"], d["end_time"] = ns, ne
+        out.append(d)
+        prev_end = ne
+    return out
+
+
+def get_video_size(path):
+    try:
+        r = run_capture(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                         "-show_entries", "stream=width,height", "-of", "csv=p=0:s=x", path])
+        w, h = r.stdout.strip().splitlines()[0].split("x")
+        return int(w), int(h)
+    except Exception:
+        return 0, 0
+
+
+def pan_keys(frames, W, H, src_w, cw, fps=3, group=4):
+    """Motion-weighted horizontal crop positions: [(time_s, crop_x), ...].
+
+    Uses weighted center-of-motion to smoothly follow the action.
+    group=4 (down from 6) for more responsive tracking.
+    """
+    max_x = max(0, src_w - cw)
+    prev = max_x / 2.0
+    cols = []
+    for a, b in zip(frames, frames[1:]):
+        col = [0] * W
+        for y in range(H):
+            row = y * W
+            for x in range(W):
+                d = a[row + x] - b[row + x]
+                col[x] += d if d >= 0 else -d
+        cols.append(col)
+    keys = []
+    for g in range(0, len(cols), group):
+        chunk = cols[g:g + group]
+        m = [max(0, sum(c[x] for c in chunk) - len(chunk) * 3) for x in range(W)]
+        tot = sum(m)
+        if tot < 40:
+            target = prev
+        else:
+            cx = sum((x + 0.5) * m[x] for x in range(W)) / tot / W * src_w
+            target = min(max(cx - cw / 2.0, 0), max_x)
+        delta = target - prev
+        # Smoother panning: smaller max delta per step, ignore tiny jitter
+        if abs(delta) < 0.05 * cw:
+            target = prev
+        else:
+            target = prev + max(-0.25 * cw, min(0.25 * cw, delta))
+        keys.append(((g + len(chunk) / 2.0) / float(fps), target))
+        prev = target
+    return keys
+
+
+def pan_expr(keys, dur):
+    """ffmpeg expression for crop x that glides between key positions."""
+    if not keys:
+        return "0"
+    xs = [k[1] for k in keys]
+    if max(xs) - min(xs) < 4:
+        return "%d" % (sum(xs) / len(xs))
+    pts = [(0.0, keys[0][1])] + list(keys) + [(dur, keys[-1][1])]
+    parts = []
+    for (t1, x1), (t2, x2) in zip(pts, pts[1:]):
+        if t2 - t1 <= 0.01:
+            continue
+        parts.append("gte(t,%.2f)*lt(t,%.2f)*(%.1f+(%.1f)*(t-%.2f)/%.2f)"
+                     % (t1, t2, x1, x2 - x1, t1, t2 - t1))
+    parts.append("gte(t,%.2f)*%.1f" % (pts[-1][0], pts[-1][1]))
+    return "+".join(parts)
+
+
+def analyze_pan(video, start, dur, src_w, src_h):
+    """Return (crop_width, x_expression) that follows the action in the clip.
+
+    Uses higher-resolution motion analysis (96x54) and 4 fps for smoother tracking.
+    """
+    cw = int(src_h * 9 / 16) // 2 * 2
+    centre = max(0, src_w - cw) // 2
+    W, H = 96, 54
+    fps = 4
+    try:
+        r = subprocess.run(
+            ["ffmpeg", "-v", "error", "-ss", "%.2f" % start, "-t", "%.2f" % dur, "-i", video,
+             "-an", "-vf", "fps=%d,scale=%d:%d,format=gray" % (fps, W, H), "-f", "rawvideo", "-"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, creationflags=CREATE_NO_WINDOW)
+        data = r.stdout
+    except Exception:
+        return cw, str(centre)
+    fs = W * H
+    frames = [data[i * fs:(i + 1) * fs] for i in range(len(data) // fs)]
+    if len(frames) < 4:
+        return cw, str(centre)
+    return cw, pan_expr(pan_keys(frames, W, H, src_w, cw, fps=fps), dur)
+
+
+# --------------------------------------------------------------------------
+# Captions (Whisper via local OpenAI-compatible API)
+# --------------------------------------------------------------------------
+def extract_audio_mp3(clip, mp3, log):
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-i", clip, "-vn",
+           "-ac", "1", "-ar", "16000", "-c:a", "libmp3lame", "-b:a", "64k", mp3]
+    r = run_capture(cmd)
+    if r.returncode != 0 or not os.path.isfile(mp3) or os.path.getsize(mp3) == 0:
+        log("  audio extraction failed: " + (r.stderr or "").strip()[-200:])
+        return False
+    return True
+
+
+def transcribe_whisper(base, mp3, lang=None, prompt=None, timeout=600):
+    """POST multipart to /v1/audio/transcriptions, return parsed JSON dict."""
+    boundary = "----HypeClipper" + str(int(time.time() * 1000))
+    parts = []
+
+    def field(name, value):
+        parts.append(("--%s\r\nContent-Disposition: form-data; name=\"%s\"\r\n\r\n%s\r\n"
+                      % (boundary, name, value)).encode("utf-8"))
+
+    field("model", WHISPER_MODEL)
+    field("response_format", "verbose_json")
+    if lang:
+        field("language", lang)
+    if prompt:
+        field("prompt", prompt)
+    with open(mp3, "rb") as f:
+        data = f.read()
+    parts.append(("--%s\r\nContent-Disposition: form-data; name=\"file\"; "
+                  "filename=\"audio.mp3\"\r\nContent-Type: audio/mpeg\r\n\r\n"
+                  % boundary).encode("utf-8"))
+    parts.append(data)
+    parts.append(("\r\n--%s--\r\n" % boundary).encode("utf-8"))
+    req = urllib.request.Request(
+        base + "/v1/audio/transcriptions", data=b"".join(parts),
+        headers=auth_headers({"Content-Type": "multipart/form-data; boundary=" + boundary}))
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read().decode("utf-8", errors="replace")
+    return json.loads(raw)
+
+
+def make_srt(base, clip, idx, log, lang=None, prompt=None, words_per_chunk=3, uppercase=True):
+    """Return path to a valid .srt in TEMP_DIR, or None (skip captions)."""
+    mp3 = os.path.join(TEMP_DIR, "cap_%d.mp3" % idx)
+    srt = os.path.join(TEMP_DIR, "cap_%d.srt" % idx)
+    try:
+        if not extract_audio_mp3(clip, mp3, log):
+            return None
+        log("  transcribing with %s..." % WHISPER_MODEL)
+        data = transcribe_whisper(base, mp3, lang, prompt)
+        # Convert JSON response to SRT text
+        srt_text = json_to_srt(data, words_per_chunk=words_per_chunk, uppercase=uppercase)
+        if "-->" not in srt_text:
+            log("  no speech detected (music-only?) - skipping captions.")
+            return None
+        with open(srt, "w", encoding="utf-8") as f:
+            f.write(srt_text + "\n")
+        log("  transcription: %d subtitle blocks generated (%d words/chunk)." % (
+            srt_text.count("-->"), words_per_chunk))
+        return srt
+    except Exception as e:  # network, HTTP, timeout, anything
+        log("  transcription failed (%s) - skipping captions." % e)
+        return None
+    finally:
+        try:
+            if os.path.isfile(mp3):
+                os.remove(mp3)
+        except OSError:
+            pass
+
+
+def caption_font(srt, preferred="Impact"):
+    """Arial has no Hindi/Punjabi glyphs; switch to Nirmala UI when those scripts appear."""
+    try:
+        text = open(srt, encoding="utf-8", errors="replace").read()
+    except OSError:
+        return preferred
+    if re.search("[\u0900-\u097F\u0A00-\u0A7F]", text):
+        return "Nirmala UI"
+    return preferred
+
+
+def build_caption_style(font, size, style_name="Viral Yellow (MrBeast)", position="Bottom (Reels safe)", vertical=True):
+    preset = CAPTION_STYLES.get(style_name, CAPTION_STYLES["Viral Yellow (MrBeast)"])
+    if "Center" in position or "Middle" in position:
+        alignment = 5
+        margin_v = 0
+    elif "Low" in position:
+        alignment = 2
+        margin_v = 45 if vertical else 20
+    else:  # "Bottom (Reels safe)"
+        alignment = 2
+        margin_v = 175 if vertical else 45
+
+    margin_lr = 40 if vertical else 30
+    return (
+        "FontName=%s,FontSize=%d,Bold=1,"
+        "PrimaryColour=%s,OutlineColour=%s,BackColour=%s,"
+        "BorderStyle=%d,Outline=%d,Shadow=%d,"
+        "Alignment=%d,MarginV=%d,MarginL=%d,MarginR=%d"
+        % (
+            font, size,
+            preset["primary"], preset["outline"], preset["back"],
+            preset["border_style"], preset["outline_w"], preset["shadow"],
+            alignment, margin_v, margin_lr, margin_lr
+        )
+    )
+
+
+def burn_captions(clip, srt, vertical, log, size=44, style_name="Viral Yellow (MrBeast)",
+                  position="Bottom (Reels safe)", font_name="Impact", preset="fast", crf=18):
+    """Burn srt into clip (in place). Returns True on success."""
+    tmp_out = clip[:-4] + ".captioned.mp4"
+    preset_data = CAPTION_STYLES.get(style_name, {})
+    chosen_font = font_name or preset_data.get("font", "Impact")
+    actual_font = caption_font(srt, preferred=chosen_font)
+    style_str = build_caption_style(actual_font, size, style_name, position, vertical)
+
+    # Run in TEMP_DIR with a bare file name so no drive-letter/colon escaping is needed.
+    vf = "subtitles=%s:force_style='%s'" % (os.path.basename(srt), style_str)
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-i", os.path.abspath(clip),
+           "-vf", vf, "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+           "-pix_fmt", "yuv420p",
+           "-c:a", "copy", "-movflags", "+faststart", os.path.abspath(tmp_out)]
+    r = subprocess.run(cmd, cwd=os.path.dirname(srt), stdout=subprocess.PIPE,
+                       stderr=subprocess.PIPE, text=True, encoding="utf-8",
+                       errors="replace", creationflags=CREATE_NO_WINDOW)
+    if r.returncode != 0 or not os.path.isfile(tmp_out):
+        log("  caption burn failed: " + (r.stderr or "").strip()[-300:])
+        try:
+            if os.path.isfile(tmp_out):
+                os.remove(tmp_out)
+        except OSError:
+            pass
+        return False
+    os.replace(tmp_out, clip)
+    return True
+
+
+# --------------------------------------------------------------------------
+# Voice-over (AI narration via local /v1/audio/speech, or an imported audio file)
+# --------------------------------------------------------------------------
+def srt_to_text(srt, limit=800):
+    if not srt or not os.path.isfile(srt):
+        return ""
+    out = []
+    for line in open(srt, encoding="utf-8", errors="replace"):
+        line = line.strip()
+        if line and "-->" not in line and not line.isdigit():
+            out.append(line)
+    return " ".join(out)[:limit]
+
+
+def write_narration(base, title, speech, dur, log):
+    """Ask the local chat model for a short hype narration line."""
+    model = pick_model(base, lambda m: None)
+    max_words = max(8, int(dur * 2.2))
+    prompt = ("Write a punchy, energetic voice-over line for a short video clip titled \"%s\". "
+              "%sUse at most %d words. Output ONLY the spoken text, no quotes, no emojis."
+              % (title.replace("_", " "),
+                 ("What is said in the clip: %s\n" % speech) if speech else "",
+                 max_words))
+    body = json.dumps({"model": model, "temperature": 0.7, "max_tokens": 1024,
+                       "messages": [{"role": "user", "content": prompt}]}).encode("utf-8")
+    req = urllib.request.Request(base + "/v1/chat/completions", data=body,
+                                 headers=auth_headers({"Content-Type": "application/json"}))
+    with urllib.request.urlopen(req, timeout=120) as r:
+        text = json.loads(r.read().decode("utf-8"))["choices"][0]["message"]["content"]
+    return re.sub(r"\s+", " ", text).strip().strip('"')
+
+
+def tts_to_mp3(base, text, model, voice, mp3):
+    body = json.dumps({"model": model, "input": text, "voice": voice,
+                       "response_format": "mp3"}).encode("utf-8")
+    req = urllib.request.Request(base + "/v1/audio/speech", data=body,
+                                 headers=auth_headers({"Content-Type": "application/json"}))
+    with urllib.request.urlopen(req, timeout=300) as r:
+        data = r.read()
+    if not data:
+        raise ValueError("empty audio returned")
+    with open(mp3, "wb") as f:
+        f.write(data)
+
+
+def mix_voiceover(clip, vo_audio, log):
+    """Duck the original audio and mix the voice-over on top, in place."""
+    tmp_out = clip[:-4] + ".vo.mp4"
+    fc = ("[0:a]volume=0.4[a0];[1:a]volume=1.0[a1];"
+          "[a0][a1]amix=inputs=2:duration=first:dropout_transition=0,volume=2[a]")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error", "-i", clip, "-i", vo_audio,
+           "-filter_complex", fc, "-map", "0:v", "-map", "[a]",
+           "-c:v", "copy", "-c:a", "aac", "-b:a", "160k", "-movflags", "+faststart", tmp_out]
+    r = run_capture(cmd)
+    if r.returncode != 0 or not os.path.isfile(tmp_out):
+        log("  voice-over mix failed: " + (r.stderr or "").strip()[-300:])
+        try:
+            if os.path.isfile(tmp_out):
+                os.remove(tmp_out)
+        except OSError:
+            pass
+        return False
+    os.replace(tmp_out, clip)
+    return True
+
+
+# --------------------------------------------------------------------------
+# Cutting
+# --------------------------------------------------------------------------
+QUALITY = {"Fast": ("veryfast", 21), "Balanced": ("medium", 18), "High": ("slow", 16)}
+BLUR_FIT = ("split[a][b];"
+            "[a]scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,"
+            "boxblur=30:8,eq=brightness=-0.08:saturation=0.7[bg];"
+            "[b]scale=1080:-2:flags=lanczos+accurate_rnd[fg];"
+            "[bg][fg]overlay=(W-w)/2:(H-h)/2")
+
+
+def build_filters(dur, pre_vf, opts, size=None):
+    vf, af = list(pre_vf), []
+    if opts.get("zoom"):
+        z = 1.15
+        vf.append("crop=trunc(iw/%s/2)*2:trunc(ih/%s/2)*2" % (z, z))
+        if size:
+            vf.append("scale=%d:%d:flags=lanczos" % size)
+        else:
+            vf.append("scale=trunc(iw*%s/2)*2:trunc(ih*%s/2)*2:flags=lanczos" % (z, z))
+    if opts.get("fade") and dur > 2:
+        vf.append("fade=t=in:st=0:d=0.5")
+        vf.append("fade=t=out:st=%.2f:d=0.5" % (dur - 0.5))
+        af.append("afade=t=in:st=0:d=0.5")
+        af.append("afade=t=out:st=%.2f:d=0.5" % (dur - 0.5))
+    if opts.get("normalize"):
+        af.insert(0, "loudnorm=I=-16:TP=-1.5:LRA=11")
+    return vf, af
+
+
+def framing_filters(video, c, dur, vertical, sw, sh, framing, log):
+    if not vertical:
+        return []
+    if not sw or not sh:
+        return ["crop=trunc(ih*9/16/2)*2:ih", "scale=1080:1920:flags=lanczos", "setsar=1"]
+    if sh >= sw:  # already portrait
+        return ["scale=1080:1920:force_original_aspect_ratio=increase", "crop=1080:1920",
+                "setsar=1"]
+    if framing.startswith("Blur"):
+        return [BLUR_FIT, "setsar=1"]
+    if framing.startswith("Smart"):
+        cw, expr = analyze_pan(video, c["start_time"], dur, sw, sh)
+        log("  smart crop: following the action (hi-res tracking)")
+        return ["crop=%d:ih:x='%s':y=0" % (cw, expr),
+                "scale=1080:1920:flags=lanczos+accurate_rnd",
+                "setsar=1"]
+    return ["crop=trunc(ih*9/16/2)*2:ih", "scale=1080:1920:flags=lanczos", "setsar=1"]
+
+
+def cut_clips(video, clips, vertical, log, opts=None, api_base_url=DEFAULT_API):
+    opts = opts or {}
+    os.makedirs(OUT_DIR, exist_ok=True)
+    os.makedirs(TEMP_DIR, exist_ok=True)
+    preset, crf = QUALITY.get(opts.get("quality", "Balanced"), QUALITY["Balanced"])
+    framing = opts.get("framing", "Blurred background fit")
+    sw, sh = get_video_size(video)
+    if vertical:
+        size = (1080, 1920)
+    else:
+        size = (sw // 2 * 2, sh // 2 * 2) if sw and sh else None
+    for i, c in enumerate(clips, 1):
+        out = os.path.join(OUT_DIR, "%d_%s.mp4" % (i, c["title"]))
+        dur = c["end_time"] - c["start_time"]
+        log("Cutting clip %d/%d: %s (%s - %s)" % (
+            i, len(clips), c["title"], fmt_time(c["start_time"]), fmt_time(c["end_time"])))
+        pre = framing_filters(video, c, dur, vertical, sw, sh, framing, log)
+        vf, af = build_filters(dur, pre, opts, size)
+        cmd = ["ffmpeg", "-y", "-hide_banner", "-v", "error",
+               "-ss", "%.2f" % c["start_time"], "-i", video, "-t", "%.2f" % dur]
+        if vf:
+            cmd += ["-vf", ",".join(vf)]
+        if af:
+            cmd += ["-af", ",".join(af)]
+        cmd += ["-c:v", "libx264", "-preset", preset, "-crf", str(crf),
+                "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
+                "-movflags", "+faststart", out]
+        code = run_stream(cmd, log)
+        if code != 0:
+            log("  -> FAILED (code %s)" % code)
+            continue
+
+        speech = ""
+        if opts.get("captions"):
+            srt = make_srt(
+                api_base_url, out, i, log,
+                lang=opts.get("cap_lang"),
+                prompt=opts.get("cap_prompt"),
+                words_per_chunk=opts.get("cap_words", 3),
+                uppercase=opts.get("cap_upper", True),
+            )
+            if srt:
+                speech = srt_to_text(srt)
+                cap_style = opts.get("cap_style", "Viral Yellow (MrBeast)")
+                cap_size = opts.get("caption_size", 44 if vertical else 26)
+                log("  burning captions (%s, size %d)..." % (cap_style, cap_size))
+                if burn_captions(
+                    out, srt, vertical, log,
+                    size=cap_size,
+                    style_name=cap_style,
+                    position=opts.get("cap_pos", "Bottom (Reels safe)"),
+                    font_name=opts.get("cap_font", "Impact"),
+                    preset=preset,
+                    crf=crf,
+                ):
+                    log("  captions burned.")
+                try:
+                    os.remove(srt)
+                except OSError:
+                    pass
+
+        vo_mode = opts.get("vo_mode", "Off")
+        vo_file = None
+        temp_vo = False
+        try:
+            if vo_mode.startswith("AI"):
+                log("  writing AI narration...")
+                text = write_narration(api_base_url, c["title"], speech, dur, log)
+                log("  narration: " + text)
+                vo_file = os.path.join(TEMP_DIR, "vo_%d.mp3" % i)
+                temp_vo = True
+                tts_to_mp3(api_base_url, text, opts.get("tts_model", "auto"),
+                           opts.get("tts_voice", "alloy"), vo_file)
+            elif vo_mode.startswith("Import"):
+                vo_file = opts.get("vo_path")
+                if not vo_file or not os.path.isfile(vo_file):
+                    log("  no voice-over audio file selected - skipping voice-over.")
+                    vo_file = None
+            if vo_file:
+                log("  mixing voice-over...")
+                if mix_voiceover(out, vo_file, log):
+                    log("  voice-over added.")
+        except Exception as e:
+            log("  voice-over failed (%s) - keeping clip without it." % e)
+        finally:
+            if temp_vo and vo_file and os.path.isfile(vo_file):
+                try:
+                    os.remove(vo_file)
+                except OSError:
+                    pass
+        log("  -> saved " + out)
+
+
+# --------------------------------------------------------------------------
+# UI
+# --------------------------------------------------------------------------
+MODE_SMART = "Smart Mix (AI + hype + replays)"
+MODE_REPLAY = "Highest Playtime (Most Replayed)"
+MODE_LOUD = "Loudest Moments (no AI)"
+MODE_INFO = {
+    MODE_SMART: "AI reads the loud moments, replay data and transcript to choose the "
+                "best clips. Needs your local LLM running.",
+    MODE_REPLAY: "Picks the most-replayed parts from YouTube's heatmap. Fast, no AI. "
+                 "Needs a YouTube link (or its .info.json).",
+    MODE_LOUD: "Picks the loudest crowd / laughter / beat-drop moments. No AI needed.",
+}
+
+ACCENT = "#1faa59"
+CARD = "#1e2126"
+MUTED = "#9aa0a6"
+BTN_GREY = "#3a3f46"
+
+
+class App(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("blue")
+        self.title(APP_NAME)
+        sw, sh = self.winfo_screenwidth(), self.winfo_screenheight()
+        w, h = min(1120, sw - 40), min(780, sh - 90)
+        self.geometry("%dx%d+%d+%d" % (w, h, max(0, (sw - w) // 2), max(0, (sh - h) // 2 - 20)))
+        self.minsize(min(940, w), min(560, h))
+        self.logq = queue.Queue()
+        self.busy = False
+        self.vo_path = ""
+        self.tool_labels = {}
+        self.installing = False
+        self._build()
+        self.after(100, self._drain)
+        self._refresh_tools()
+        self.after(700, self._auto_offer)
+        self.log("Ready. Paste a YouTube link or pick a local video, then press "
+                 "'Find & Cut Hype Clips'.")
+
+    def report_callback_exception(self, exc, val, tb):
+        self.log("UI ERROR: %r" % (val,))
+
+    # ---------- layout helpers ----------
+    def _card(self, parent, title):
+        f = ctk.CTkFrame(parent, fg_color=CARD, corner_radius=12)
+        f.pack(fill="x", pady=(0, 10))
+        ctk.CTkLabel(f, text=title, font=ctk.CTkFont(size=14, weight="bold")
+                     ).pack(anchor="w", padx=14, pady=(10, 4))
+        return f
+
+    def _label(self, parent, text, muted=False, wrap=0):
+        return ctk.CTkLabel(parent, text=text, anchor="w", justify="left",
+                            text_color=MUTED if muted else None, wraplength=wrap)
+
+    def _build(self):
+        header = ctk.CTkFrame(self, fg_color="transparent")
+        header.pack(fill="x", padx=18, pady=(12, 6))
+        ctk.CTkLabel(header, text="HypeClipper", font=ctk.CTkFont(size=26, weight="bold")
+                     ).pack(side="left")
+        ctk.CTkLabel(header, text="  find the hype, cut the clips", text_color=MUTED
+                     ).pack(side="left", pady=(8, 0))
+        for tool in ("yt-dlp", "ffprobe", "ffmpeg"):
+            lab = ctk.CTkLabel(header, text=tool, font=ctk.CTkFont(size=12))
+            lab.pack(side="right", padx=6)
+            self.tool_labels[tool] = lab
+
+        body = ctk.CTkFrame(self, fg_color="transparent")
+        body.pack(fill="both", expand=True, padx=18, pady=(0, 14))
+        body.columnconfigure(0, weight=0)
+        body.columnconfigure(1, weight=1)
+        body.rowconfigure(0, weight=1)
+
+        left = ctk.CTkScrollableFrame(body, width=400, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
+        right = ctk.CTkFrame(body, fg_color=CARD, corner_radius=12)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        self._sec_source(left)
+        self._sec_find(left)
+        self._sec_edit(left)
+        self._sec_captions(left)
+        self._sec_voice(left)
+        self._build_right(right)
+
+    # ---------- left-hand sections ----------
+    def _sec_source(self, parent):
+        c = self._card(parent, "1  Video source")
+        self.src = ctk.CTkEntry(c, height=38,
+                                placeholder_text="Paste a YouTube link (or a local file path)")
+        self.src.pack(fill="x", padx=14, pady=(0, 8))
+        ctk.CTkButton(c, text="Select Local Video (.mp4 / .webm / .mkv)", height=44,
+                      fg_color=ACCENT, hover_color="#178a47",
+                      font=ctk.CTkFont(size=14, weight="bold"),
+                      command=self.pick_file).pack(fill="x", padx=14, pady=(0, 10))
+
+        self._label(c, "Downloads are saved here first, then clipped:", muted=True
+                    ).pack(fill="x", padx=14)
+        frow = ctk.CTkFrame(c, fg_color="transparent")
+        frow.pack(fill="x", padx=14, pady=(2, 6))
+        ctk.CTkButton(frow, text="Browse", width=70, fg_color=BTN_GREY,
+                      hover_color="#4a5058", command=self.pick_dl_dir).pack(side="right")
+        self.dl_dir = ctk.CTkEntry(frow)
+        self.dl_dir.insert(0, VIDEOS_DIR)
+        self.dl_dir.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.dl_only = ctk.CTkSwitch(c, text="Download only (don't clip)")
+        self.dl_only.pack(anchor="w", padx=14, pady=(2, 8))
+
+        qrow = ctk.CTkFrame(c, fg_color="transparent")
+        qrow.pack(fill="x", padx=14, pady=(0, 6))
+        self._label(qrow, "YouTube quality").pack(side="left")
+        self.dl_quality = ctk.CTkOptionMenu(
+            qrow, width=175,
+            values=["Maximum (4K/1440p/Best)", "1080p Full HD (Crisp)", "720p HD", "Auto / Fast"])
+        self.dl_quality.set("1080p Full HD (Crisp)")
+        self.dl_quality.pack(side="right")
+
+        crow = ctk.CTkFrame(c, fg_color="transparent")
+        crow.pack(fill="x", padx=14, pady=(0, 6))
+        self._label(crow, "Cookies from browser").pack(side="left")
+        self.cookies = ctk.CTkOptionMenu(
+            crow, width=110, values=["None", "chrome", "edge", "firefox", "brave"])
+        self.cookies.pack(side="right")
+        ctk.CTkButton(c, text="Install Missing Tools (ffmpeg, yt-dlp)", height=34,
+                      fg_color="#2563eb", hover_color="#1d4fc4",
+                      command=self.install_clicked).pack(fill="x", padx=14, pady=(0, 6))
+        trow = ctk.CTkFrame(c, fg_color="transparent")
+        trow.pack(fill="x", padx=14, pady=(0, 12))
+        trow.columnconfigure((0, 1), weight=1)
+        ctk.CTkButton(trow, text="Update yt-dlp", fg_color=BTN_GREY, hover_color="#4a5058",
+                      command=self.update_ytdlp).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(trow, text="Check Tools", fg_color=BTN_GREY, hover_color="#4a5058",
+                      command=self.check_tools).grid(row=0, column=1, sticky="ew", padx=(4, 0))
+
+    def _sec_find(self, parent):
+        c = self._card(parent, "2  Find the clips")
+        self._label(c, "Find clips by").pack(fill="x", padx=14)
+        self.mode = ctk.CTkOptionMenu(c, values=[MODE_SMART, MODE_REPLAY, MODE_LOUD],
+                                      command=self._mode_changed)
+        self.mode.pack(fill="x", padx=14, pady=(2, 2))
+        self.mode_info = self._label(c, MODE_INFO[MODE_SMART], muted=True, wrap=350)
+        self.mode_info.pack(fill="x", padx=14, pady=(0, 8))
+
+        self._label(c, "Output shape").pack(fill="x", padx=14)
+        self.aspect = ctk.CTkSegmentedButton(c, values=["Original 16:9", "Vertical 9:16"])
+        self.aspect.set("Original 16:9")
+        self.aspect.pack(fill="x", padx=14, pady=(2, 8))
+
+        nrow = ctk.CTkFrame(c, fg_color="transparent")
+        nrow.pack(fill="x", padx=14, pady=(0, 8))
+        nrow.columnconfigure((0, 1), weight=1)
+        self._label(nrow, "Max clips").grid(row=0, column=0, sticky="w")
+        self._label(nrow, "Clip length (sec)").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.max_clips = ctk.CTkEntry(nrow)
+        self.max_clips.insert(0, "3")
+        self.max_clips.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        self.clip_len = ctk.CTkEntry(nrow)
+        self.clip_len.insert(0, "30")
+        self.clip_len.grid(row=1, column=1, sticky="ew", padx=(4, 0))
+
+        arow = ctk.CTkFrame(c, fg_color="transparent")
+        arow.pack(fill="x", padx=14, pady=(0, 12))
+        arow.columnconfigure(0, weight=3)
+        arow.columnconfigure(1, weight=2)
+        self._label(arow, "API URL (OpenAI-compatible)").grid(row=0, column=0, sticky="w")
+        self._label(arow, "API Key").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.api = ctk.CTkEntry(arow)
+        self.api.insert(0, load_settings().get("api_url") or DEFAULT_API)
+        self.api.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        self.api_key = ctk.CTkEntry(arow, show="*", placeholder_text="FREELLMAPI_KEY")
+        if API_KEY:
+            self.api_key.insert(0, API_KEY)
+        self.api_key.grid(row=1, column=1, sticky="ew", padx=(4, 0))
+
+    def _sec_edit(self, parent):
+        c = self._card(parent, "3  Editing  (all optional)")
+        self.snap = ctk.CTkSwitch(c, text="Snap cuts to natural pauses")
+        self.snap.select()
+        self.snap.pack(anchor="w", padx=14, pady=3)
+        self.fade = ctk.CTkSwitch(c, text="Fade in / out")
+        self.fade.pack(anchor="w", padx=14, pady=3)
+        self.zoom = ctk.CTkSwitch(c, text="Punch-in zoom (1.15x)")
+        self.zoom.pack(anchor="w", padx=14, pady=3)
+        self.normalize = ctk.CTkSwitch(c, text="Normalize loudness")
+        self.normalize.pack(anchor="w", padx=14, pady=3)
+        self._label(c, "Vertical framing (9:16 only)").pack(fill="x", padx=14, pady=(8, 0))
+        self.framing = ctk.CTkOptionMenu(
+            c, values=["Blurred background fit", "Smart crop (follow action)", "Center crop"])
+        self.framing.pack(fill="x", padx=14, pady=(2, 8))
+        self._label(c, "Video quality").pack(fill="x", padx=14)
+        self.quality = ctk.CTkSegmentedButton(c, values=["Fast", "Balanced", "High"])
+        self.quality.set("Balanced")
+        self.quality.pack(fill="x", padx=14, pady=(2, 12))
+
+    def _sec_captions(self, parent):
+        c = self._card(parent, "4  Captions  (AI Viral Styles)")
+        top_row = ctk.CTkFrame(c, fg_color="transparent")
+        top_row.pack(fill="x", padx=14, pady=(0, 4))
+        self.captions = ctk.CTkSwitch(top_row, text="Auto-Burn Captions")
+        self.captions.select()
+        self.captions.pack(side="left")
+        self.cap_upper = ctk.CTkSwitch(top_row, text="ALL CAPS (Viral)")
+        self.cap_upper.select()
+        self.cap_upper.pack(side="right")
+
+        self._label(c, "Caption style preset").pack(fill="x", padx=14, pady=(4, 0))
+        self.cap_style = ctk.CTkOptionMenu(
+            c, values=list(CAPTION_STYLES.keys()))
+        self.cap_style.set("Viral Yellow (MrBeast)")
+        self.cap_style.pack(fill="x", padx=14, pady=(2, 6))
+
+        r1 = ctk.CTkFrame(c, fg_color="transparent")
+        r1.pack(fill="x", padx=14, pady=(0, 6))
+        r1.columnconfigure((0, 1), weight=1)
+        self._label(r1, "Font").grid(row=0, column=0, sticky="w")
+        self._label(r1, "Position").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.cap_font = ctk.CTkOptionMenu(
+            r1, values=["Impact", "Arial Black", "Arial", "Segoe UI Black"])
+        self.cap_font.set("Impact")
+        self.cap_font.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        self.cap_pos = ctk.CTkOptionMenu(
+            r1, values=["Bottom (Reels safe)", "Center (Focus)", "Bottom Low"])
+        self.cap_pos.set("Bottom (Reels safe)")
+        self.cap_pos.grid(row=1, column=1, sticky="ew", padx=(4, 0))
+
+        r2 = ctk.CTkFrame(c, fg_color="transparent")
+        r2.pack(fill="x", padx=14, pady=(0, 6))
+        r2.columnconfigure((0, 1), weight=1)
+        self._label(r2, "Pacing (words)").grid(row=0, column=0, sticky="w")
+        self._label(r2, "Language").grid(row=0, column=1, sticky="w", padx=(8, 0))
+        self.cap_pacing = ctk.CTkOptionMenu(
+            r2, values=["Punchy (1-2 words)", "Fast (2-3 words)", "Balanced (3-4 words)", "Sentence (5-7)"])
+        self.cap_pacing.set("Fast (2-3 words)")
+        self.cap_pacing.grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        self.cap_lang = ctk.CTkOptionMenu(
+            r2, values=list(CAPTION_LANGS.keys()))
+        self.cap_lang.grid(row=1, column=1, sticky="ew", padx=(4, 0))
+
+        self._label(c, "Caption size").pack(fill="x", padx=14, pady=(2, 0))
+        self.cap_size = ctk.CTkSegmentedButton(c, values=["Small", "Medium", "Large", "Huge"])
+        self.cap_size.set("Medium")
+        self.cap_size.pack(fill="x", padx=14, pady=(2, 10))
+
+    def _sec_voice(self, parent):
+        c = self._card(parent, "5  Voice-over  (optional)")
+        self.vo_mode = ctk.CTkOptionMenu(
+            c, values=["Off", "AI Narration (TTS)", "Import Audio File"])
+        self.vo_mode.pack(fill="x", padx=14, pady=(0, 8))
+        vrow = ctk.CTkFrame(c, fg_color="transparent")
+        vrow.pack(fill="x", padx=14, pady=(0, 8))
+        vrow.columnconfigure((0, 1), weight=1)
+        self.tts_model = ctk.CTkEntry(vrow, placeholder_text="TTS model")
+        self.tts_model.insert(0, "auto")
+        self.tts_model.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.tts_voice = ctk.CTkEntry(vrow, placeholder_text="Voice")
+        self.tts_voice.insert(0, "alloy")
+        self.tts_voice.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.vo_btn = ctk.CTkButton(c, text="Choose Voice-Over Audio File...",
+                                    fg_color=BTN_GREY, hover_color="#4a5058",
+                                    command=self.pick_vo)
+        self.vo_btn.pack(fill="x", padx=14, pady=(0, 12))
+
+    # ---------- right-hand panel ----------
+    def _build_right(self, r):
+        self.go = ctk.CTkButton(r, text="Find & Cut Hype Clips", height=54,
+                                font=ctk.CTkFont(size=17, weight="bold"),
+                                fg_color="#2563eb", hover_color="#1d4fc4",
+                                command=self.start)
+        self.go.pack(fill="x", padx=14, pady=(14, 8))
+        self.progress = ctk.CTkProgressBar(r, mode="indeterminate", height=6)
+        self.progress.pack(fill="x", padx=14)
+        self.progress.set(0)
+        self.status = ctk.CTkLabel(r, text="Idle", anchor="w", text_color=MUTED)
+        self.status.pack(fill="x", padx=16, pady=(6, 4))
+        self.console = ctk.CTkTextbox(r, font=ctk.CTkFont(family="Consolas", size=12),
+                                      wrap="word")
+        self.console.pack(fill="both", expand=True, padx=14, pady=(0, 8))
+        self.console.configure(state="disabled")
+        brow = ctk.CTkFrame(r, fg_color="transparent")
+        brow.pack(fill="x", padx=14, pady=(0, 14))
+        brow.columnconfigure((0, 1, 2), weight=1)
+        ctk.CTkButton(brow, text="Open Output Folder", fg_color=BTN_GREY,
+                      hover_color="#4a5058", command=self.open_out
+                      ).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        ctk.CTkButton(brow, text="Open Videos Folder", fg_color=BTN_GREY,
+                      hover_color="#4a5058", command=self.open_videos
+                      ).grid(row=0, column=1, sticky="ew", padx=4)
+        ctk.CTkButton(brow, text="Clear Log", fg_color=BTN_GREY, hover_color="#4a5058",
+                      command=self.clear_log).grid(row=0, column=2, sticky="ew", padx=(4, 0))
+
+    # ---------- status / logging ----------
+    def log(self, msg):
+        msg = str(msg)
+        self.logq.put(msg)
+        try:
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write("%s  %s\n" % (time.strftime("%H:%M:%S"), msg))
+        except OSError:
+            pass
+
+    def set_status(self, text, color=None):
+        self.logq.put(("status", text, color))
+
+    def _drain(self):
+        try:
+            while True:
+                item = self.logq.get_nowait()
+                if isinstance(item, tuple):
+                    _, text, color = item
+                    self.status.configure(text=text, text_color=color or MUTED)
+                    continue
+                self.console.configure(state="normal")
+                self.console.insert("end", item + "\n")
+                self.console.see("end")
+                self.console.configure(state="disabled")
+        except queue.Empty:
+            pass
+        self.after(100, self._drain)
+
+    def clear_log(self):
+        self.console.configure(state="normal")
+        self.console.delete("1.0", "end")
+        self.console.configure(state="disabled")
+
+    def _mode_changed(self, value):
+        self.mode_info.configure(text=MODE_INFO.get(value, ""))
+
+    def _refresh_tools(self):
+        for tool, lab in self.tool_labels.items():
+            if shutil.which(tool):
+                lab.configure(text="\u25cf " + tool, text_color="#3ddc84")
+            else:
+                lab.configure(text="\u25cf " + tool + " missing", text_color="#ff6b6b")
+
+    # ---------- actions ----------
+    def pick_file(self):
+        p = filedialog.askopenfilename(
+            title="Select a video",
+            filetypes=[("Video files", "*.mp4 *.webm *.mkv"), ("All files", "*.*")])
+        if p:
+            self.src.delete(0, "end")
+            self.src.insert(0, p)
+            self.set_status("Selected: " + os.path.basename(p))
+
+    def pick_dl_dir(self):
+        d = filedialog.askdirectory(title="Choose download folder")
+        if d:
+            self.dl_dir.delete(0, "end")
+            self.dl_dir.insert(0, d)
+
+    def pick_vo(self):
+        p = filedialog.askopenfilename(
+            title="Select voice-over audio",
+            filetypes=[("Audio files", "*.mp3 *.wav *.m4a *.aac *.ogg *.flac"),
+                       ("All files", "*.*")])
+        if p:
+            self.vo_path = p
+            self.vo_btn.configure(text="Voice-over: " + os.path.basename(p))
+            self.vo_mode.set("Import Audio File")
+
+    def _open_folder(self, folder):
+        os.makedirs(folder, exist_ok=True)
+        try:
+            if os.name == "nt":
+                os.startfile(folder)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception as e:
+            self.log("Could not open folder: %s" % e)
+
+    def open_out(self):
+        self._open_folder(OUT_DIR)
+
+    def open_videos(self):
+        self._open_folder(self.dl_dir.get().strip() or VIDEOS_DIR)
+
+    def _auto_offer(self):
+        need = missing_tools()
+        if need:
+            self._offer_install(need)
+
+    def install_clicked(self):
+        need = missing_tools()
+        if not need:
+            messagebox.showinfo(APP_NAME, "ffmpeg, ffprobe and yt-dlp are already installed.")
+            return
+        self._offer_install(need)
+
+    def _offer_install(self, need):
+        if self.installing or self.busy:
+            return
+        if os.name != "nt":
+            messagebox.showerror(APP_NAME, "Missing: %s\n\nInstall them with your package "
+                                 "manager (e.g. brew / apt)." % ", ".join(need))
+            return
+        if messagebox.askyesno(
+                APP_NAME,
+                "HypeClipper needs these free tools: %s\n\nDownload and install them "
+                "automatically now? (one-time download, roughly 150 MB)" % ", ".join(need)):
+            self.installing = True
+            self.go.configure(state="disabled")
+            self.progress.start()
+            threading.Thread(target=self._install_worker, daemon=True).start()
+
+    def _install_worker(self):
+        ok = False
+        try:
+            self.set_status("Installing tools...", "#4da3ff")
+            ok = install_tools(self.log, self.set_status)
+        except Exception as e:
+            self.log("INSTALL ERROR: %r" % (e,))
+        finally:
+            self.installing = False
+
+            def done():
+                self.progress.stop()
+                self.progress.set(0)
+                self.go.configure(state="normal")
+                self._refresh_tools()
+            self.after(0, done)
+            if ok:
+                self.set_status("Tools installed - you're ready to go", "#3ddc84")
+            else:
+                self.set_status("Some tools are still missing - see the console", "#ff6b6b")
+
+    def check_tools(self):
+        self._refresh_tools()
+
+        def work():
+            for tool in ("ffmpeg", "ffprobe", "yt-dlp"):
+                path = shutil.which(tool)
+                if not path:
+                    self.log("[tools] %s: NOT FOUND" % tool)
+                    continue
+                ver = ""
+                try:
+                    flag = "--version" if tool == "yt-dlp" else "-version"
+                    ver = run_capture([tool, flag]).stdout.splitlines()[0]
+                except Exception:
+                    pass
+                self.log("[tools] %s: %s  %s" % (tool, path, ver))
+        threading.Thread(target=work, daemon=True).start()
+
+    def update_ytdlp(self):
+        def work():
+            if not shutil.which("yt-dlp"):
+                self.log("yt-dlp not found, nothing to update.")
+                return
+            self.log("Updating yt-dlp...")
+            lines = []
+            run_stream(["yt-dlp", "-U"], self.log, collect=lines)
+            if any("pip" in l.lower() for l in lines):
+                self.log("yt-dlp was installed with pip. Run:  pip install -U yt-dlp")
+        threading.Thread(target=work, daemon=True).start()
+
+    def start(self):
+        if self.busy:
+            return
+        src = self.src.get().strip().strip('"')
+        if not src:
+            messagebox.showwarning(APP_NAME, "Paste a YouTube link or select a local video first.")
+            return
+        if not os.path.isfile(src) and not is_url(src):
+            messagebox.showwarning(APP_NAME, "That is not an existing file or a valid http(s) link.")
+            return
+        try:
+            max_clips = max(1, int(self.max_clips.get()))
+            clip_len = max(5, int(self.clip_len.get()))
+        except ValueError:
+            messagebox.showwarning(APP_NAME, "Max clips and Clip length must be whole numbers.")
+            return
+        need = missing_tools()
+        if not is_url(src):
+            need = [t for t in need if t != "yt-dlp"]
+        if need:
+            self._offer_install(need)
+            return
+        is_vert = self.aspect.get().startswith("Vertical")
+        if is_vert:
+            sizes = {"Small": 32, "Medium": 44, "Large": 56, "Huge": 70}
+        else:
+            sizes = {"Small": 20, "Medium": 26, "Large": 34, "Huge": 44}
+
+        pacing_map = {
+            "Punchy (1-2 words)": 2,
+            "Fast (2-3 words)": 3,
+            "Balanced (3-4 words)": 4,
+            "Sentence (5-7)": 6,
+        }
+        words_per_chunk = pacing_map.get(self.cap_pacing.get(), 3)
+        lang, prompt = CAPTION_LANGS[self.cap_lang.get()]
+        opts = {"captions": bool(self.captions.get()),
+                "cap_style": self.cap_style.get(),
+                "cap_font": self.cap_font.get(),
+                "cap_pos": self.cap_pos.get(),
+                "cap_words": words_per_chunk,
+                "cap_upper": bool(self.cap_upper.get()),
+                "caption_size": sizes.get(self.cap_size.get(), 44 if is_vert else 26),
+                "cap_lang": lang, "cap_prompt": prompt,
+                "fade": bool(self.fade.get()),
+                "zoom": bool(self.zoom.get()),
+                "normalize": bool(self.normalize.get()),
+                "vo_mode": self.vo_mode.get(),
+                "vo_path": self.vo_path,
+                "tts_model": self.tts_model.get().strip() or "auto",
+                "tts_voice": self.tts_voice.get().strip() or "alloy",
+                "mode": self.mode.get(),
+                "cookies": self.cookies.get(),
+                "dl_quality": self.dl_quality.get(),
+                "dl_dir": self.dl_dir.get().strip() or VIDEOS_DIR,
+                "dl_only": bool(self.dl_only.get()),
+                "snap": bool(self.snap.get()),
+                "framing": self.framing.get(),
+                "quality": self.quality.get()}
+        set_api_key(self.api_key.get())
+        save_settings(api_url=self.api.get().strip() or DEFAULT_API, api_key=API_KEY)
+        args = (src, max_clips, clip_len, self.aspect.get().startswith("Vertical"),
+                self.api.get().strip() or DEFAULT_API, opts)
+        self.busy = True
+        self.go.configure(state="disabled", text="Working...")
+        self.progress.start()
+        self.set_status("Starting...", "#4da3ff")
+        threading.Thread(target=self._worker, args=args, daemon=True).start()
+
+    def _finish(self):
+        self.busy = False
+
+        def reset():
+            self.progress.stop()
+            self.progress.set(0)
+            self.go.configure(state="normal", text="Find & Cut Hype Clips")
+        self.after(0, reset)
+
+    def _worker(self, src, max_clips, clip_len, vertical, api_url, opts):
+        log = self.log
+        mode = opts.get("mode", MODE_SMART)
+        ok = False
+        try:
+            # 1. input
+            if os.path.isfile(src):
+                video = src
+                log("Using local file: " + video)
+            else:
+                self.set_status("Downloading video...", "#4da3ff")
+                video = download_video(
+                    src, log,
+                    cookies_browser=opts.get("cookies"),
+                    dl_dir=opts.get("dl_dir"),
+                    quality=opts.get("dl_quality")
+                )
+                if not video:
+                    return
+                log("Downloaded: " + video)
+                if opts.get("dl_only"):
+                    log("Download only - finished. File saved in: " + os.path.dirname(video))
+                    ok = True
+                    return
+            if opts.get("dl_only"):
+                log("That is already a local file, nothing to download.")
+                ok = True
+                return
+
+            info = None
+            info_path = os.path.splitext(video)[0] + ".info.json"
+            if os.path.isfile(info_path):
+                try:
+                    with open(info_path, encoding="utf-8") as f:
+                        info = json.load(f)
+                except Exception as e:
+                    log("Could not read info.json: %s" % e)
+
+            duration = get_duration(video, info)
+            log("Duration: %s" % fmt_time(duration))
+            log("Mode: " + mode)
+
+            clips = []
+            a_peaks, h_peaks = [], heatmap_peaks(info)
+
+            # 2a. highest playtime (YouTube "Most replayed")
+            if mode == MODE_REPLAY:
+                self.set_status("Reading replay heatmap...", "#4da3ff")
+                clips = replayed_clips(info, duration, clip_len, max_clips)
+                if clips:
+                    log("Picked %d highest-playtime window(s) from the replay heatmap."
+                        % len(clips))
+                else:
+                    log("No YouTube replay heatmap for this video (needs a YouTube link or "
+                        "its .info.json, and enough views). Using loudest moments instead.")
+                    mode = MODE_LOUD
+
+            # 2b. loudest moments / smart mix
+            if not clips:
+                self.set_status("Scanning audio for hype...", "#4da3ff")
+                a_peaks = audio_peaks(video, duration, log)
+                log("Heatmap peaks: %d" % len(h_peaks) if h_peaks
+                    else "No YouTube heatmap available.")
+
+            if not clips and mode == MODE_SMART:
+                transcript = load_transcript(video)
+                log("Transcript loaded (%d chars)." % len(transcript) if transcript
+                    else "No subtitles found.")
+                self.set_status("Asking the AI for the best moments...", "#4da3ff")
+                try:
+                    base = api_base(api_url)
+                    model = pick_model(base, log)
+                    raw = ask_llm(base, model, duration, clip_len, max_clips,
+                                  a_peaks, h_peaks, transcript, log)
+                    clips = clean_clips(raw, duration, clip_len, max_clips)
+                except (urllib.error.URLError, OSError, ValueError, KeyError,
+                        RuntimeError, json.JSONDecodeError) as e:
+                    log("LLM step failed: %s" % e)
+
+            if not clips:
+                log("Selecting loudest / hottest moments directly.")
+                clips = fallback_clips(a_peaks, h_peaks, duration, clip_len, max_clips)
+            if not clips:
+                log("No clips could be determined.")
+                return
+            if opts.get("snap"):
+                self.set_status("Finding clean cut points...", "#4da3ff")
+                mids = detect_silences(video, log)
+                clips = snap_clips(clips, mids, duration, clip_len) or clips
+            log("Selected clips:\n" + json.dumps(clips, indent=2))
+
+            # 3. cut
+            self.set_status("Cutting clips...", "#4da3ff")
+            cut_clips(video, clips, vertical, log, opts, api_base(api_url))
+            log("Done! Clips are in: " + OUT_DIR)
+            ok = True
+        except Exception as e:
+            log("UNEXPECTED ERROR: %r" % e)
+        finally:
+            if ok:
+                self.set_status("Done - clips are in output_clips", "#3ddc84")
+            else:
+                self.set_status("Stopped - see the console for details", "#ff6b6b")
+            self._finish()
+
+
+if __name__ == "__main__":
+    try:
+        App().mainloop()
+    except Exception:
+        import traceback
+        tb = traceback.format_exc()
+        try:
+            with open(os.path.join(BASE, "hypeclipper_crash.log"), "w", encoding="utf-8") as f:
+                f.write(tb)
+        except OSError:
+            pass
+        try:
+            import tkinter
+            root = tkinter.Tk()
+            root.withdraw()
+            messagebox.showerror(APP_NAME, "HypeClipper crashed:\n\n" + tb[-1500:])
+        except Exception:
+            pass
